@@ -1,0 +1,457 @@
+module s2c_spi_slave (
+input wire sclk,
+input wire [7:0] tx_data,
+input wire cs,
+input wire mosi,
+
+output reg [7:0] rx_data,
+output reg miso
+);
+
+reg [7:0] shift_tx;
+reg [7:0] shift_rx;
+reg [2:0] bit_cnt;
+
+always @(negedge cs) begin
+shift_tx <= tx_data;
+shift_rx <= 0;
+bit_cnt <= 3'd7;
+end
+
+always @(posedge cs) begin
+rx_data <= shift_rx;
+end
+
+always @(posedge sclk) begin
+if (!cs) begin
+miso <= shift_tx[bit_cnt]; // send
+shift_rx <= {shift_rx[6:0], mosi}; // receive
+bit_cnt <= bit_cnt - 1;
+end
+end
+
+endmodule
+
+
+module s2c_spi_master (
+input wire clk,
+input wire reset,
+
+input wire start,
+input wire [7:0] tx_data,
+output reg busy,
+output reg [7:0] rx_data,
+
+// SPI signals
+output reg sclk,
+output reg mosi,
+input wire miso,
+output reg cs
+);
+
+reg [7:0] shift_tx;
+reg [7:0] shift_rx;
+reg [2:0] bit_cnt;
+
+always @(posedge clk or posedge reset) begin
+if (reset) begin
+sclk <= 0;
+cs <= 1;
+mosi <= 0;
+busy <= 0;
+shift_tx <= 0;
+shift_rx <= 0;
+bit_cnt <= 0;
+rx_data <= 0;
+
+end
+else begin
+if (start && !busy) begin
+busy <= 1;
+cs <= 0;
+sclk <= 0;
+shift_tx <= tx_data;
+bit_cnt <= 3'd7;
+end
+else if (busy) begin
+
+// Toggle clock
+sclk <= ~sclk;
+
+// rising edge → send data
+if(sclk == 1'b0) begin
+mosi <= shift_tx[7];
+shift_tx <= {shift_tx[6:0], 1'b0};
+end
+else begin
+
+// falling edge → sample data
+shift_rx <= {shift_rx[6:0], miso};
+
+if (bit_cnt == 0) begin
+busy <= 0;
+cs <= 1;
+sclk <= 0;
+rx_data <= {shift_rx[6:0], miso};
+end
+else begin
+bit_cnt <= bit_cnt - 1;
+end
+end
+end
+end
+end
+
+endmodule
+
+
+/*`include "spi_master.sv"
+`include "spi_slave.sv"*/
+
+module s2c_spi_master_slave (
+
+input enable,
+input power_in,
+
+input wire clk,
+input wire reset,
+input wire start,
+input wire [7:0] m_tx_data,
+input wire [7:0] s_tx_data,
+
+output wire busy,
+output wire [7:0] m_rx_data,
+output wire [7:0] s_rx_data,
+output wire clock_req,
+output wire power_req
+
+);
+
+wire sclk;
+wire mosi;
+wire miso;
+wire cs;
+
+assign power_req = enable;
+assign clock_req = power_in;
+
+// SPI Master
+s2c_spi_master u_spi_master (
+.clk(clk),
+.reset(reset),
+.start(start),
+.tx_data(m_tx_data),
+.rx_data(m_rx_data),
+.busy(busy),
+
+.sclk(sclk),
+.mosi(mosi),
+.miso(miso),
+.cs(cs)
+);
+
+// SPI Slave
+s2c_spi_slave u_spi_slave (
+.sclk(sclk),
+.tx_data(s_tx_data),
+.cs(cs),
+.mosi(mosi),
+.rx_data(s_rx_data),
+.miso(miso)
+);
+
+endmodule
+
+testbench code:
+`include "spi_if.sv"
+`include "spi_txn.sv"
+`include "spi_generator.sv"
+`include "spi_driver.sv"
+`include "spi_monitor.sv"
+`include "spi_coverage.sv"
+`include "spi_agent.sv"
+`include "spi_scoreboard.sv"
+`include "spi_env.sv"
+
+mailbox #(spi_txn) gen2drv = new;
+mailbox #(spi_txn) mon2scb = new;
+mailbox #(spi_txn) mon2cov = new;
+
+class spi_txn;
+
+rand bit [7:0] m_tx_data;
+rand bit [7:0] s_tx_data;
+
+bit [7:0] m_rx_data;
+bit [7:0] s_rx_data;
+
+static int count = 5;
+static int scoreboard_count;
+
+function void display(string tag);
+$display("----- %s -----", tag);
+$display("m_tx=%0d m_rx=%0d", m_tx_data, m_rx_data);
+$display("s_tx=%0d s_rx=%0d", s_tx_data, s_rx_data);
+endfunction
+endclass
+
+interface spi_if(input logic clk);
+
+logic reset;
+logic start;
+
+logic [7:0] m_tx_data;
+logic [7:0] s_tx_data;
+
+logic busy;
+
+logic [7:0] m_rx_data;
+logic [7:0] s_rx_data;
+
+endinterface
+
+class generator;
+
+task run();
+
+spi_txn txn;
+
+repeat (spi_txn::count) begin
+txn = new();
+
+if (!txn.randomize())
+$error("Randomization failed");
+
+//txn.display("GEN");
+
+gen2drv.put(txn);
+end
+endtask
+
+endclass
+
+class driver;
+
+virtual spi_if vif;
+
+function new();
+vif = top.intf;
+endfunction
+
+task run();
+spi_txn txn;
+
+forever begin
+gen2drv.get(txn);
+
+wait (vif.busy == 0);
+
+vif.m_tx_data = txn.m_tx_data;
+vif.s_tx_data = txn.s_tx_data;
+
+@(posedge vif.clk);
+
+vif.start = 1;
+@(posedge vif.clk);
+vif.start = 0;
+
+//@(posedge vif.busy);
+@(negedge vif.busy);
+end
+endtask
+
+endclass
+
+class monitor;
+
+virtual spi_if vif;
+
+function new();
+vif = top.intf;
+endfunction
+
+task run();
+spi_txn txn;
+
+forever begin
+txn = new();
+
+wait(vif.busy == 1);
+
+txn.m_tx_data = vif.m_tx_data;
+txn.s_tx_data = vif.s_tx_data;
+
+wait(vif.busy == 0);
+
+@(posedge vif.clk);
+
+txn.m_rx_data = vif.m_rx_data;
+txn.s_rx_data = vif.s_rx_data;
+
+//txn.display("MON");
+
+mon2scb.put(txn);
+mon2cov.put(txn);
+end
+endtask
+
+endclass
+
+class coverage;
+
+spi_txn txn;
+
+covergroup cg;
+option.per_instance = 1;
+
+M_DATA: coverpoint txn.m_rx_data;
+S_DATA: coverpoint txn.s_rx_data;
+
+CROSS: cross M_DATA, S_DATA;
+
+endgroup
+
+function new();
+cg = new();
+endfunction
+
+task run();
+forever begin
+mon2cov.get(txn);
+cg.sample();
+$display("Coverage = %0.2f", $get_coverage());
+end
+endtask
+
+endclass
+
+class agent;
+
+generator gen;
+driver drv;
+monitor mon;
+coverage cov;
+
+function new();
+gen = new();
+drv = new();
+mon = new();
+cov = new();
+endfunction
+
+task run();
+fork
+gen.run();
+drv.run();
+mon.run();
+cov.run();
+join
+endtask
+
+endclass
+
+class scoreboard;
+
+event DONE;
+
+task run();
+spi_txn txn;
+
+forever begin
+mon2scb.get(txn);
+txn.scoreboard_count++;
+
+$display("\n=== SCOREBOARD %0d ===", txn.scoreboard_count);
+txn.display("SCB");
+
+// Master -> Slave check
+if (txn.s_rx_data == txn.m_tx_data)
+$display("M -> S PASS");
+else
+$error("M -> S FAIL exp=%0d got=%0d",
+txn.m_tx_data, txn.s_rx_data);
+
+// Slave -> Master check
+if (txn.m_rx_data == txn.s_tx_data)
+$display("S -> M PASS");
+else
+$error("S -> M FAIL exp=%0d got=%0d",
+txn.s_tx_data, txn.m_rx_data);
+
+$display("=========================\n");
+
+if (txn.scoreboard_count >= spi_txn::count)
+->DONE;
+end
+endtask
+
+endclass
+
+class env;
+
+agent agt;
+scoreboard scb;
+
+function new();
+agt = new();
+scb = new();
+endfunction
+
+task stop();
+wait (scb.DONE.triggered);
+endtask
+
+task run();
+fork
+agt.run();
+scb.run();
+stop();
+join_any
+endtask
+
+endclass
+
+module top;
+
+logic clk;
+
+spi_if intf(clk);
+
+s2c_spi_master_slave dut (
+.enable(1'b1),
+.power_in(1'b1),
+.clk(clk),
+.reset(intf.reset),
+.start(intf.start),
+.m_tx_data(intf.m_tx_data),
+.s_tx_data(intf.s_tx_data),
+.busy(intf.busy),
+.m_rx_data(intf.m_rx_data),
+.s_rx_data(intf.s_rx_data),
+.clock_req(),
+.power_req()
+);
+
+always #5 clk = ~clk;
+
+env e;
+
+initial begin
+clk = 0;
+intf.reset = 1;
+
+#20;
+intf.reset = 0;
+
+e = new();
+e.run();
+
+$finish;
+end
+
+initial begin
+$dumpfile("dump.vcd");
+$dumpvars(0, intf);
+end
+
+endmodule
